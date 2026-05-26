@@ -1,0 +1,445 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "time.h"
+
+// ---- WiFi Credentials ----
+ const char* ssid = "Elect_AT103";
+const char* password = "AT1032022";
+
+// ---- Pin Definitions ----
+#define TDS_PIN 35
+#define PH_PIN 32
+#define MQ_AOUT 34
+#define TDS_MOTOR_PIN 4
+#define PH_MOTOR_PIN 27
+#define GROW_LIGHT_RELAY 5
+#define PELTIER_RELAY 18
+#define WATER_PUMP_RELAY 19
+#define MIST_MAKER_RELAY 21
+#define EXHAUST_FAN_RELAY 22
+#define LED_PIN 2
+#define DHTPIN 25
+#define WATER_LEVEL1_PIN 33
+#define WATER_LEVEL2_PIN 26
+#define WATER_LEVEL3_PIN 39
+
+// ---- Constants ----
+#define VREF 3.3
+#define ADC_RES 4095.0
+#define TDS_LOW 560
+#define TDS_HIGH 840
+#define PH_LOW 5.8
+#define PH_HIGH 9.0
+#define HUMIDITY_LOW 60.0
+#define WATER_LEVEL_THRESHOLD 300
+#define TDS_INTERVAL 3600000UL
+#define PH_INTERVAL 3600000UL
+#define MOTOR_RUN_TIME 5000
+#define FAN_INTERVAL 7200000UL
+#define FAN_RUN_TIME 300000UL
+#define WATER_LEVEL_INTERVAL 86400000UL
+#define MQ_INTERVAL 5000UL
+#define SHEET_INTERVAL 300000UL // Send data to Google Sheet every 5 min
+
+WebServer server(80);
+
+// ---- Variables ----
+float tdsValue = 0.0;
+float phValue = 0.0;
+float humidity = 0.0;
+float temperature = 0.0;
+float waterLevel1 = 0.0, waterLevel2 = 0.0, waterLevel3 = 0.0;
+float mqVoltage = 0.0;
+int mqValue = 0;
+
+unsigned long lastTDSMeasure = 0;
+unsigned long lastPHMeasure = 0;
+unsigned long lastDHTRead = 0;
+unsigned long lastFanRun = 0;
+unsigned long fanStartTime = 0;
+unsigned long lastWaterLevelCheck = 0;
+unsigned long lastMQRead = 0;
+unsigned long lastSheetSend = 0;
+
+bool tdsMotorState = false, phMotorState = false;
+bool growLightState = false, peltierState = false;
+bool mistMakerState = false, exhaustFanState = false;
+
+String tdsMsg = "Waiting for first measurement...";
+String phMsg = "Waiting for first measurement...";
+String dhtMsg = "Waiting for first reading...";
+String mistMsg = "Waiting for first humidity check...";
+String fanMsg = "Waiting for first cycle...";
+String waterLevelMsg1 = "Waiting for measurement...";
+String waterLevelMsg2 = "Waiting for measurement...";
+String waterLevelMsg3 = "Waiting for measurement...";
+String mqMsg = "Waiting for CO2 reading...";
+
+// ---- pH Calibration ----
+float PH_SLOPE = -5.7;
+float PH_OFFSET = 21.34;
+
+// ---- Manual Time Setup ----
+struct tm currentTime;
+void setManualTime() {
+  currentTime.tm_year = 2025 - 1900;
+  currentTime.tm_mon = 9;
+  currentTime.tm_mday = 13;
+  currentTime.tm_hour = 12;
+  currentTime.tm_min = 0;
+  currentTime.tm_sec = 0;
+  time_t now = mktime(&currentTime);
+  struct timeval tv = { now, 0 };
+  settimeofday(&tv, NULL);
+}
+
+// ---- DHT22 Functions ----
+uint8_t dhtData[5];
+bool readDHT22() {
+  uint8_t bits[40]; uint8_t i, j;
+  pinMode(DHTPIN, OUTPUT); digitalWrite(DHTPIN, LOW); delay(1);
+  digitalWrite(DHTPIN, HIGH); delayMicroseconds(30); pinMode(DHTPIN, INPUT);
+
+  unsigned int loopCnt = 10000;
+  while(digitalRead(DHTPIN)==HIGH && loopCnt--) delayMicroseconds(1);
+  if(loopCnt==0) return false;
+  loopCnt=10000;
+  while(digitalRead(DHTPIN)==LOW && loopCnt--) delayMicroseconds(1);
+  if(loopCnt==0) return false;
+  loopCnt=10000;
+  while(digitalRead(DHTPIN)==HIGH && loopCnt--) delayMicroseconds(1);
+  if(loopCnt==0) return false;
+
+  for(i=0;i<40;i++){
+    loopCnt=10000;
+    while(digitalRead(DHTPIN)==LOW && loopCnt--) delayMicroseconds(1);
+    if(loopCnt==0) return false;
+    unsigned long t=micros();
+    loopCnt=10000;
+    while(digitalRead(DHTPIN)==HIGH && loopCnt--) delayMicroseconds(1);
+    if(loopCnt==0) return false;
+    bits[i] = (micros()-t) > 40 ? 1 : 0;
+  }
+
+  for(i=0;i<5;i++){
+    dhtData[i]=0;
+    for(j=0;j<8;j++){
+      dhtData[i]<<=1;
+      dhtData[i]|=bits[i*8+j];
+    }
+  }
+
+  if(dhtData[4] != ((dhtData[0]+dhtData[1]+dhtData[2]+dhtData[3]) & 0xFF)) return false;
+  return true;
+}
+
+void updateDHT22() {
+  if(readDHT22()){
+    humidity=((dhtData[0]<<8)+dhtData[1])*0.1;
+    temperature=(((dhtData[2]&0x7F)<<8)+dhtData[3])*0.1;
+    if(dhtData[2]&0x80) temperature=-temperature;
+    dhtMsg="DHT22 data updated.";
+
+    if(humidity<HUMIDITY_LOW){ 
+      digitalWrite(MIST_MAKER_RELAY,LOW); 
+      mistMakerState=true; 
+      mistMsg="Humidity is low. Mist maker ON.";
+    }
+    else{ 
+      digitalWrite(MIST_MAKER_RELAY,HIGH); 
+      mistMakerState=false; 
+      mistMsg="Humidity OK. Mist maker OFF.";
+    }
+  }else{
+    dhtMsg="Failed to read DHT22.";
+  }
+}
+
+// ---- MQ Gas Sensor (CO2) ----
+void readMQSensor() {
+  int sensorValue = analogRead(MQ_AOUT);
+  int co2Content = sensorValue - 2000;
+  if(co2Content<0) co2Content=0;
+  mqVoltage = sensorValue*(3.3/4095.0);
+  mqValue = co2Content;
+  mqMsg="CO2 content read successfully.";
+}
+
+// ---- TDS and pH ----
+void runMotor(int pin,bool &state){
+  digitalWrite(pin,LOW); 
+  state=true; 
+  delay(MOTOR_RUN_TIME); 
+  digitalWrite(pin,HIGH); 
+  state=false;
+}
+
+void measureTDS(){
+  int val=analogRead(TDS_PIN);
+  tdsValue=map(val,0,4095,300,800);
+
+  if(tdsValue<TDS_LOW){
+    tdsMsg="Nutrient low. Pump ON.";
+    runMotor(TDS_MOTOR_PIN,tdsMotorState);
+    tdsMsg="Pump OFF.";
+  }
+  else if(tdsValue>TDS_HIGH) tdsMsg="TDS high, stable.";
+  else tdsMsg="TDS optimal.";
+}
+
+void measurePH(){
+  int raw=analogRead(PH_PIN);
+  float voltage=(raw/ADC_RES)*VREF;
+  phValue=PH_SLOPE*voltage+PH_OFFSET;
+
+  if(phValue<PH_LOW||phValue>PH_HIGH){
+    phMsg="pH out of range. Pump ON.";
+    runMotor(PH_MOTOR_PIN,phMotorState);
+    phMsg="pH stabilized. Pump OFF.";
+  }
+  else phMsg="pH optimal.";
+}
+
+// ---- Water Level ----
+void checkWaterLevels(){
+  int r1=analogRead(WATER_LEVEL1_PIN);
+  int r2=analogRead(WATER_LEVEL2_PIN);
+  int r3=analogRead(WATER_LEVEL3_PIN);
+
+  waterLevel1=r1;
+  waterLevel2=r2;
+  waterLevel3=r3;
+
+  waterLevelMsg1=(r1<WATER_LEVEL_THRESHOLD)?"Water Level 1 LOW":"Water Level 1 OK";
+  waterLevelMsg2=(r2<WATER_LEVEL_THRESHOLD)?"Water Level 2 LOW":"Water Level 2 OK";
+  waterLevelMsg3=(r3<WATER_LEVEL_THRESHOLD)?"Water Level 3 LOW":"Water Level 3 OK";
+}
+
+// ---- Google Sheet ----
+void sendToGoogleSheet(){
+  if(WiFi.status()==WL_CONNECTED){
+    WiFiClientSecure client; 
+    client.setInsecure();
+    HTTPClient https;
+
+    String url="https://script.google.com/macros/s/AKfycbwYWglOx9p76eIc54E7IyEokkoPLgcN-Twt-5rI0mujcYLqhS-r3ZmQzWLkiPnnCVqi/exec";
+    url += "?tds="+String(tdsValue)+"&ph="+String(phValue)+"&co2="+String(mqValue)+"&temp="+String(temperature)+"&hum="+String(humidity)+"&w1="+String(waterLevel1)+"&w2="+String(waterLevel2)+"&w3="+String(waterLevel3);
+
+    https.begin(client,url); 
+    int httpCode=https.GET();
+    if(httpCode>0) Serial.println("✅ Data sent!"); 
+    else Serial.println("❌ Failed");
+    https.end();
+  }
+}
+
+// ---- Web Page ----
+void handleRoot() {
+  String html = R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="10">
+<title>Hydroponic Control Dashboard</title>
+<style>
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #a8dadc, #f1faee);
+  text-align: center;
+  color: #333;
+  margin: 0;
+  padding: 0;
+}
+h2 {
+  background: #1d3557;
+  color: white;
+  padding: 15px;
+  font-size: 24px;
+  margin: 0;
+}
+.section {
+  background: white;
+  border-radius: 15px;
+  box-shadow: 0px 4px 8px rgba(0,0,0,0.2);
+  margin: 20px auto;
+  padding: 20px;
+  width: 85%;
+  max-width: 420px;
+}
+.value {
+  font-size: 26px;
+  margin: 10px 0;
+  color: #1d3557;
+}
+.status {
+  font-size: 22px;
+  padding: 10px;
+  border-radius: 10px;
+  width: 150px;
+  display: inline-block;
+}
+.on { background: #4CAF50; color: white; }
+.off { background: #f44336; color: white; }
+.msg {
+  background: #f5f5f5;
+  border-radius: 10px;
+  padding: 10px;
+  margin-top: 10px;
+  font-size: 16px;
+}
+</style>
+</head>
+<body>
+<h2>Hydroponic Automatic Control System</h2>
+)====";
+
+  html += "<div class='section'><h3>TDS</h3><div class='value'>" + String(tdsValue,0) + " ppm</div><div class='status "+String(tdsMotorState?"on":"off")+"'>"+(tdsMotorState?"ON":"OFF")+"</div><div class='msg'>"+tdsMsg+"</div></div>";
+  html += "<div class='section'><h3>pH</h3><div class='value'>" + String(phValue,2) + "</div><div class='status "+String(phMotorState?"on":"off")+"'>"+(phMotorState?"ON":"OFF")+"</div><div class='msg'>"+phMsg+"</div></div>";
+  html += "<div class='section'><h3>CO2</h3><div class='value'>" + String(mqValue) + "</div><div class='msg'>" + mqMsg + "</div></div>";
+  html += "<div class='section'><h3>Temperature</h3><div class='value'>" + String(temperature,1) + " °C</div></div>";
+  html += "<div class='section'><h3>Humidity</h3><div class='value'>" + String(humidity,1) + " %</div><div class='msg'>" + mistMsg + "</div></div>";
+
+  html += "<div class='section'><h3>Water Levels</h3>";
+  html += "<div class='value'>Sensor1: "+String(waterLevel1,0)+"</div><div class='msg'>"+waterLevelMsg1+"</div>";
+  html += "<div class='value'>Sensor2: "+String(waterLevel2,0)+"</div><div class='msg'>"+waterLevelMsg2+"</div>";
+  html += "<div class='value'>Sensor3: "+String(waterLevel3,0)+"</div><div class='msg'>"+waterLevelMsg3+"</div></div>";
+
+  // 🔥 COMPONENT STATUS SECTION
+  html += "<div class='section'><h3>Component Status</h3>";
+
+  html += "<p>Grow Light: <span class='status "+String(growLightState?"on":"off")+"'>"+(growLightState?"ON":"OFF")+"</span></p>";
+  html += "<p>Peltier: <span class='status "+String(peltierState?"on":"off")+"'>"+(peltierState?"ON":"OFF")+"</span></p>";
+  html += "<p>Mist Maker: <span class='status "+String(mistMakerState?"on":"off")+"'>"+(mistMakerState?"ON":"OFF")+"</span></p>";
+  html += "<p>Exhaust Fan: <span class='status "+String(exhaustFanState?"on":"off")+"'>"+(exhaustFanState?"ON":"OFF")+"</span></p>";
+  html += "<p>Water Pump: <span class='status "+String(digitalRead(WATER_PUMP_RELAY)==LOW?"on":"off")+"'>"+(digitalRead(WATER_PUMP_RELAY)==LOW?"ON":"OFF")+"</span></p>";
+  html += "<p>TDS Motor: <span class='status "+String(tdsMotorState?"on":"off")+"'>"+(tdsMotorState?"ON":"OFF")+"</span></p>";
+  html += "<p>pH Motor: <span class='status "+String(phMotorState?"on":"off")+"'>"+(phMotorState?"ON":"OFF")+"</span></p>";
+
+  html += "</div></body></html>";
+
+  server.send(200,"text/html",html);
+}
+
+// ---- Setup ----
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(TDS_PIN, INPUT); 
+  pinMode(PH_PIN, INPUT); 
+  pinMode(MQ_AOUT, INPUT);
+  pinMode(TDS_MOTOR_PIN, OUTPUT); 
+  pinMode(PH_MOTOR_PIN, OUTPUT); 
+  pinMode(GROW_LIGHT_RELAY, OUTPUT);
+  pinMode(PELTIER_RELAY, OUTPUT); 
+  pinMode(WATER_PUMP_RELAY, OUTPUT); 
+  pinMode(MIST_MAKER_RELAY, OUTPUT);
+  pinMode(EXHAUST_FAN_RELAY, OUTPUT); 
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(WATER_LEVEL1_PIN, INPUT); 
+  pinMode(WATER_LEVEL2_PIN, INPUT); 
+  pinMode(WATER_LEVEL3_PIN, INPUT);
+
+  digitalWrite(TDS_MOTOR_PIN,HIGH); 
+  digitalWrite(PH_MOTOR_PIN,HIGH); 
+  digitalWrite(GROW_LIGHT_RELAY,HIGH);
+  digitalWrite(PELTIER_RELAY,HIGH); 
+  digitalWrite(MIST_MAKER_RELAY,HIGH); 
+  digitalWrite(EXHAUST_FAN_RELAY,HIGH);
+  digitalWrite(WATER_PUMP_RELAY,LOW);
+
+  WiFi.begin(ssid,password);
+  Serial.print("Connecting to Wi-Fi");
+  while(WiFi.status()!=WL_CONNECTED){ 
+    delay(500); 
+    Serial.print("."); 
+  }
+  Serial.println(); 
+  Serial.print("Connected! IP: "); 
+  Serial.println(WiFi.localIP());
+
+  setManualTime();
+  server.on("/",handleRoot);
+  server.begin();
+  Serial.println("Web Server started!");
+}
+
+// ---- Loop ----
+void loop(){
+  server.handleClient();
+  unsigned long currentMillis=millis();
+
+  if(currentMillis-lastTDSMeasure>=TDS_INTERVAL){ 
+    lastTDSMeasure=currentMillis; 
+    measureTDS(); 
+  }
+
+  if(currentMillis-lastPHMeasure>=PH_INTERVAL){ 
+    lastPHMeasure=currentMillis; 
+    measurePH(); 
+  }
+
+  if(currentMillis-lastDHTRead>=10000){ 
+    lastDHTRead=currentMillis; 
+    updateDHT22(); 
+  }
+
+  if(currentMillis-lastWaterLevelCheck>=WATER_LEVEL_INTERVAL){ 
+    lastWaterLevelCheck=currentMillis; 
+    checkWaterLevels(); 
+  }
+
+  if(currentMillis-lastMQRead>=MQ_INTERVAL){ 
+    lastMQRead=currentMillis; 
+    readMQSensor(); 
+  }
+
+  if(currentMillis-lastSheetSend>=SHEET_INTERVAL){ 
+    lastSheetSend=currentMillis; 
+    sendToGoogleSheet(); 
+  }
+
+  time_t now=time(nullptr);
+  struct tm *timeinfo=localtime(&now);
+  int hour=timeinfo->tm_hour;
+
+  if(hour>=9 && hour<17){
+    digitalWrite(GROW_LIGHT_RELAY,LOW); 
+    growLightState=true; 
+    digitalWrite(PELTIER_RELAY,LOW); 
+    peltierState=true;
+  }
+  else{
+    digitalWrite(GROW_LIGHT_RELAY,HIGH); 
+    growLightState=false; 
+    digitalWrite(PELTIER_RELAY,HIGH); 
+    peltierState=false;
+  }
+
+  if((currentMillis-lastFanRun>=FAN_INTERVAL)&&!exhaustFanState){
+    digitalWrite(EXHAUST_FAN_RELAY,LOW); 
+    exhaustFanState=true; 
+    fanStartTime=currentMillis; 
+    fanMsg="Fan ON for 5 min";
+  }
+
+  if(exhaustFanState && (currentMillis-fanStartTime>=FAN_RUN_TIME)){
+    digitalWrite(EXHAUST_FAN_RELAY,HIGH); 
+    exhaustFanState=false; 
+    lastFanRun=currentMillis; 
+    fanMsg="Fan OFF";
+  }
+  // ---- SEND SENSOR VALUES TO ARDUINO FOR LCD ----
+Serial.print("TDS:");
+Serial.print(tdsValue);
+Serial.print(",PH:");
+Serial.print(phValue, 2);
+Serial.print(",TEMP:");
+Serial.print(temperature, 1);
+Serial.print(",HUM:");
+Serial.print(humidity, 1);
+Serial.print(",CO2:");
+Serial.println(mqValue);
+
+}
